@@ -1,9 +1,12 @@
 # MonixOne.OpenObservability
 
-![MonixOne.OpenObservability](assets/openobservability-icon.png)
+![MonixOne.OpenObservability](https://raw.githubusercontent.com/Shulyakovskiy/MonixOne.OpenObservability/main/assets/openobservability-icon.png)
 
 Центральная телеметрия для ASP.NET Core и .NET 9/10: OpenTelemetry, Sentry,
 корреляция запросов, HTTP-логирование с маскированием тел и диагностика исключений.
+
+[Репозиторий](https://github.com/Shulyakovskiy/MonixOne.OpenObservability) ·
+[Сообщить об ошибке](https://github.com/Shulyakovskiy/MonixOne.OpenObservability/issues)
 
 ## Содержание
 
@@ -41,7 +44,7 @@ ASP.NET Core и `HttpClient` используют стандартный `tracep
 
 ```xml
 <ItemGroup>
-    <PackageVersion Include="MonixOne.OpenObservability" Version="1.0.0" />
+    <PackageVersion Include="MonixOne.OpenObservability" Version="1.0.1" />
 </ItemGroup>
 ```
 
@@ -498,4 +501,4 @@ GitHub environment `production`, NuGet trusted publishing и секрет `NUGET
 
 ## Лицензия
 
-[MIT](LICENSE).
+[MIT](https://github.com/Shulyakovskiy/MonixOne.OpenObservability/blob/main/LICENSE).
