@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <NoWarn>$(NoWarn);CS1591</NoWarn>
+        <PackageId>MonixOne.OpenObservability</PackageId>
+        <Title>MonixOne.OpenObservability</Title>
+        <Copyright>MonixOne</Copyright>
+        <PackageIcon>assets/openobservability-icon.png</PackageIcon>
+        <Version>1.0.0</Version>
+        <Authors>Shulyakovsky.E</Authors>
+        <Description>Central OpenTelemetry logs, traces, metrics, Sentry, HTTP body masking and automatic exception diagnostics for .NET services.</Description>
+        <PackageTags>opentelemetry;observability;logging;http;redaction;aspnetcore</PackageTags>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    </PropertyGroup>
+    <ItemGroup>
+        <FrameworkReference Include="Microsoft.AspNetCore.App" />
+        <PackageReference Include="Microsoft.Extensions.Hosting" />
+        <PackageReference Include="Microsoft.Extensions.Http.Diagnostics" />
+        <PackageReference Include="Microsoft.Extensions.Compliance.Redaction" />
+        <PackageReference Include="JsonMasking" />
+        <PackageReference Include="Nerdbank.Streams" />
+        <PackageReference Include="Refit" />
+        <PackageReference Include="Polly.Core" />
+        <PackageReference Include="Scrutor" />
+        <PackageReference Include="Sentry.AspNetCore" />
+        <PackageReference Include="OpenTelemetry.Extensions.Hosting" />
+        <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" />
+        <PackageReference Include="OpenTelemetry.Instrumentation.AspNetCore" />
+        <PackageReference Include="OpenTelemetry.Instrumentation.Http" />
+    </ItemGroup>
+    <ItemGroup>
+        <InternalsVisibleTo Include="MonixOne.OpenObservability.Tests" />
+        <None Include="../../README.md" Link="README.md" Pack="true" PackagePath="/" />
+        <None Include="../../assets/openobservability-icon.png" Link="assets/openobservability-icon.png" Pack="true" PackagePath="assets/" />
+    </ItemGroup>
+</Project>
