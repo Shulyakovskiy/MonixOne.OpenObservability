@@ -70,5 +70,18 @@ internal static class HttpLoggingConfiguration
             foreach (var header in _responseHeaders)
                 options.ResponseHeadersDataClasses.Add(header, DataClassification.None);
         });
+
+        // The SDK's named transports use synchronous Send(). Exclude them from
+        // application loggers and body capture without replacing SDK client settings.
+        string[] exporterClients = ["OtlpLogExporter", "OtlpTraceExporter", "OtlpMetricExporter"];
+        foreach (var name in exporterClients)
+            services.AddHttpClient(name)
+                .RemoveAllLoggers()
+                .ConfigureAdditionalHttpMessageHandlers((handlers, _) =>
+                {
+                    for (var index = handlers.Count - 1; index >= 0; index--)
+                        if (handlers[index] is HttpBodyLoggingHandler)
+                            handlers.RemoveAt(index);
+                });
     }
 }

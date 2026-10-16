@@ -6,7 +6,7 @@
         <Title>MonixOne.OpenObservability</Title>
         <Copyright>MonixOne</Copyright>
         <PackageIcon>assets/openobservability-icon.png</PackageIcon>
-        <Version>1.0.1</Version>
+        <Version>1.0.2</Version>
         <Authors>Shulyakovsky.E</Authors>
         <Description>Central OpenTelemetry logs, traces and metrics for .NET 9/10 services, with Sentry integration, HTTP body masking and automatic exception diagnostics.</Description>
         <PackageTags>opentelemetry;observability;logging;tracing;metrics;sentry;http;httpclient;redaction;aspnetcore</PackageTags>
@@ -16,7 +16,7 @@
         <RepositoryUrl>https://github.com/Shulyakovskiy/MonixOne.OpenObservability</RepositoryUrl>
         <RepositoryType>git</RepositoryType>
         <PublishRepositoryUrl>true</PublishRepositoryUrl>
-        <PackageReleaseNotes>Updated NuGet metadata, repository links and documentation for NuGet.org.</PackageReleaseNotes>
+        <PackageReleaseNotes>Fix OTLP HTTP export by excluding SDK transport clients from application HTTP logging and body capture. Verify HTTP request logging across methods and status codes, and OTLP export of logs, traces and metrics.</PackageReleaseNotes>
         <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
         <IncludeSymbols>true</IncludeSymbols>
         <SymbolPackageFormat>snupkg</SymbolPackageFormat>

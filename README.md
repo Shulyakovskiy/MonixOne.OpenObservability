@@ -44,7 +44,7 @@ ASP.NET Core и `HttpClient` используют стандартный `tracep
 
 ```xml
 <ItemGroup>
-    <PackageVersion Include="MonixOne.OpenObservability" Version="1.0.1" />
+    <PackageVersion Include="MonixOne.OpenObservability" Version="1.0.2" />
 </ItemGroup>
 ```
 
@@ -172,6 +172,11 @@ Observability__Logging__ConsoleEnabled=false
 `Microsoft=Warning`. Явные правила для этих категорий в `Logging:LogLevel`
 сохраняют приоритет.
 
+Входящие запросы логируются для всех HTTP-методов и итоговых статусов, включая 4xx/5xx.
+Отдельно включать HTTP-логи не требуется. Исключены `/api/health` и вложенные маршруты;
+явные фильтры конкретного provider сохраняют приоритет. OTLP-экспорт требует
+`Observability:Logging:Enabled=true` и корректного `OtlpEndpoint`.
+
 Например, исходящий захват тел можно отключить отдельно:
 
 ```json
@@ -194,6 +199,10 @@ Observability__Logging__ConsoleEnabled=false
 Исходящие метаданные логирует `AddExtendedHttpClientLogging()` для всех клиентов
 `IHttpClientFactory`, включая Refit и OAuth backchannel.
 Тела передаются в лог через адаптер `HttpContent` и библиотечный `MonitoringStream`.
+
+Транспортные HTTP-клиенты OTLP-exporters исключены из HTTP-логирования приложения
+и захвата тел. Это сохраняет синхронную отправку и настройки транспорта SDK
+и не создаёт HTTP-логи о передаче самой телеметрии.
 
 Захват пассивный: учитываются только отправленные или прочитанные байты.
 Сохраняются cancellation, клиентские таймауты, заголовки, `Content-Length`
