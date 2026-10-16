@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build, test and pack
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: |
+            9.0.x
+            10.0.x
+
+      - name: Restore
+        run: dotnet restore MonixOne.OpenObservability.sln --disable-parallel
+
+      - name: Build
+        run: >-
+          dotnet build MonixOne.OpenObservability.sln --configuration Release --no-restore
+          --disable-build-servers -m:1 -p:GeneratePackageOnBuild=false
+
+      - name: Test
+        run: >-
+          dotnet test --project
+          tests/MonixOne.OpenObservability.Tests/MonixOne.OpenObservability.Tests.csproj
+          --configuration Release --no-build --no-restore --
+          --minimum-expected-tests 28 --no-ansi --progress off
+
+      - name: Pack
+        run: >-
+          dotnet pack src/MonixOne.OpenObservability/MonixOne.OpenObservability.csproj
+          --configuration Release --no-build --output artifacts/nuget
+          -p:GeneratePackageOnBuild=false

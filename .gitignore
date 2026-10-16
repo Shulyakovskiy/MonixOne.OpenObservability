@@ -1,0 +1,22 @@
+# Build and test output
+bin/
+obj/
+artifacts/
+TestResults/
+*.nupkg
+*.snupkg
+
+# Local IDE files
+.idea/
+.vs/
+.vscode/
+*.iml
+*.suo
+*.user
+*.userosscache
+*.sln.docstates
+*.DotSettings.user
+
+# macOS metadata
+.DS_Store
+._*
