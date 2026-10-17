@@ -142,6 +142,7 @@ public sealed class HttpBodyLoggingTests
         using var client = host.Services.GetRequiredService<IHttpClientFactory>().CreateClient("slow");
         using var request = new HttpRequestMessage(HttpMethod.Get, server.Urls.Single() + "/private-path?token=private-query");
         request.Options.Set(new HttpRequestOptionsKey<string>(Refit.HttpRequestMessageOptions.RelativePathTemplate), "/{id}");
+        request.Options.Set(new HttpRequestOptionsKey<Type>(Refit.HttpRequestMessageOptions.InterfaceType), typeof(HttpBodyLoggingTests));
 
         using var response = await client.SendAsync(request, TestContext.Current.CancellationToken);
 
@@ -150,6 +151,13 @@ public sealed class HttpBodyLoggingTests
         span.Tags.FirstOrDefault(tag => tag.Key == "http.route").Value.ShouldBe("/{id}");
         span.DisplayName.ShouldNotContain("private-");
         span.Status.ShouldBe(ActivityStatusCode.Error);
+        var metadata = logs.Entries.Where(entry => entry.ContainsKey("dependency_client") && !entry.ContainsKey("ResponseBody"))
+            .ShouldHaveSingleItem();
+        metadata["dependency_http_route"].ShouldBe("/{id}");
+        metadata["dependency_address"].ShouldBe("127.0.0.1");
+        metadata["dependency_port"].ShouldBe(new Uri(server.Urls.Single()).Port);
+        metadata["upstream_status_code"].ShouldBe(404);
+        string.Join(" ", metadata.Values).ShouldNotContain("private-");
         await host.StopAsync(TestContext.Current.CancellationToken);
     }
 

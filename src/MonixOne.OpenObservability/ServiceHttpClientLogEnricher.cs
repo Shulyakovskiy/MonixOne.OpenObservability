@@ -14,6 +14,15 @@ internal sealed class ServiceHttpClientLogEnricher : IHttpClientLogEnricher
     public void Enrich(IEnrichmentTagCollector collector, HttpRequestMessage request,
         HttpResponseMessage? response, Exception? exception)
     {
+        foreach (var attribute in CreateRequestAttributes(request))
+            if (attribute.Value is not null)
+                collector.Add(attribute.Key, attribute.Value);
+        if (response is not null)
+            collector.Add("upstream_status_code", (int)response.StatusCode);
+        if (exception is not null)
+            foreach (var attribute in ExceptionDiagnosticsExtensions.CreateAttributes(exception))
+                if (attribute.Value is not null && attribute.Key is "failure_kind" or "http_request_error" or "socket_error_code")
+                    collector.Add(attribute.Key, attribute.Value);
         if (request.Options.TryGetValue(new HttpRequestOptionsKey<string>(HttpRequestMessageOptions.RelativePathTemplate), out var route))
             collector.Add("http_route", route);
         if (request.Options.TryGetValue(new HttpRequestOptionsKey<Type>(HttpRequestMessageOptions.InterfaceType), out var contract))
@@ -23,6 +32,21 @@ internal sealed class ServiceHttpClientLogEnricher : IHttpClientLogEnricher
         // Select only these three safe content headers through the supported enrichment hook.
         AddContentHeaders(collector, "http.request.header", request.Content?.Headers);
         AddContentHeaders(collector, "http.response.header", response?.Content.Headers);
+    }
+
+    internal static List<KeyValuePair<string, object?>> CreateRequestAttributes(HttpRequestMessage request)
+    {
+        List<KeyValuePair<string, object?>> attributes = [new("dependency_http_method", request.Method.Method)];
+        if (request.RequestUri is { IsAbsoluteUri: true } uri)
+        {
+            attributes.Add(new("dependency_address", uri.Host));
+            attributes.Add(new("dependency_port", uri.Port));
+        }
+        if (request.Options.TryGetValue(new HttpRequestOptionsKey<string>(HttpRequestMessageOptions.RelativePathTemplate), out var route))
+            attributes.Add(new("dependency_http_route", route));
+        if (request.Options.TryGetValue(new HttpRequestOptionsKey<Type>(HttpRequestMessageOptions.InterfaceType), out var contract))
+            attributes.Add(new("dependency_client", contract.FullName));
+        return attributes;
     }
 
     private static void AddContentHeaders(IEnrichmentTagCollector collector, string prefix, HttpContentHeaders? headers)

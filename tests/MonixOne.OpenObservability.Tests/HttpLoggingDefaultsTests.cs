@@ -88,6 +88,52 @@ public sealed class HttpLoggingDefaultsTests
     }
 
     [Fact]
+    public async Task ErrorHandler_FinalStatusIsSeparateFromExceptionTimeSnapshot()
+    {
+        using var exporter = new RecordingExporter(includeErrors: true);
+        var builder = CreateBuilder();
+        builder.Services.AddOpenTelemetry().WithLogging(logging =>
+            logging.AddProcessor(new SimpleLogRecordExportProcessor(exporter)));
+        using var host = builder.Build();
+        var context = new DefaultHttpContext { RequestServices = host.Services };
+        context.Request.Method = "POST";
+        context.Request.Path = "/users/private-id";
+        context.SetEndpoint(new RouteEndpoint(_ => Task.CompletedTask,
+            RoutePatternFactory.Parse("/users/{id}"), 0, EndpointMetadataCollection.Empty, "users"));
+        host.Services.GetRequiredService<IHttpContextAccessor>().HttpContext = context;
+        try
+        {
+            var pipeline = new ApplicationBuilder(host.Services);
+            pipeline.UseOpenObservability();
+            pipeline.Use(next => async http =>
+            {
+                try { await next(http); }
+                catch (HttpRequestException exception)
+                {
+                    host.Services.GetRequiredService<ILoggerFactory>().CreateLogger("incident.test")
+                        .LogError(exception, "Dependency failed");
+                    http.Response.StatusCode = 502;
+                }
+            });
+            pipeline.Run(_ => throw new HttpRequestException("private-error", null, HttpStatusCode.ServiceUnavailable));
+
+            await pipeline.Build()(context);
+
+            var error = exporter.Entries.Where(entry => entry.Attributes.Any(field => field.Key == "failure_kind"))
+                .ShouldHaveSingleItem();
+            error.Attributes.ShouldContain(field => field.Key == "upstream_status_code" && Equals(field.Value, 503));
+            error.Attributes.ShouldContain(field => field.Key == "http_response_status_code_at_log" && Equals(field.Value, 200));
+            error.Attributes.ShouldNotContain(field => field.Key == "http_status_code");
+            var completion = exporter.Entries.Where(entry => entry.Attributes.Any(field =>
+                field.Key == "event_name" && Equals(field.Value, "http.request.completed"))).ShouldHaveSingleItem();
+            completion.Attributes.ShouldContain(field => field.Key == "http_status_code" && Equals(field.Value, 502));
+            completion.Attributes.Single(field => field.Key == "trace_id").Value
+                .ShouldBe(error.Attributes.Single(field => field.Key == "trace_id").Value);
+        }
+        finally { host.Services.GetRequiredService<IHttpContextAccessor>().HttpContext = null; }
+    }
+
+    [Fact]
     public async Task OtlpHttp_AllSignals_UseTransportOutsideApplicationHttpLogging()
     {
         var requests = new ConcurrentQueue<(string Path, string ContentType, byte[] Body)>();
@@ -184,14 +230,15 @@ public sealed class HttpLoggingDefaultsTests
         await pipeline.Build()(context);
     }
 
-    private sealed class RecordingExporter : BaseExporter<LogRecord>
+    private sealed class RecordingExporter(bool includeErrors = false) : BaseExporter<LogRecord>
     {
         internal ConcurrentQueue<(LogLevel Level, string Message, KeyValuePair<string, object?>[] Attributes)> Entries { get; } = new();
 
         public override ExportResult Export(in Batch<LogRecord> batch)
         {
             foreach (var entry in batch)
-                if (entry.CategoryName == "Microsoft.AspNetCore.HttpLogging.HttpLoggingMiddleware")
+                if (entry.CategoryName == "Microsoft.AspNetCore.HttpLogging.HttpLoggingMiddleware"
+                    || includeErrors && entry.CategoryName == "incident.test")
                     Entries.Enqueue((entry.LogLevel, entry.FormattedMessage ?? "", entry.Attributes?.ToArray() ?? []));
             return ExportResult.Success;
         }

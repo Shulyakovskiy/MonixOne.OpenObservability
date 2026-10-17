@@ -38,6 +38,9 @@ internal sealed class HttpBodyLoggingHandler(ILogger<HttpBodyLoggingHandler> log
             new("server_address", request.RequestUri?.Host),
             new("http_status_code", response is null ? null : (int)response.StatusCode)
         };
+        fields.AddRange(ServiceHttpClientLogEnricher.CreateRequestAttributes(request));
+        if (response is not null)
+            fields.Add(new("upstream_status_code", (int)response.StatusCode));
         if (request.Options.TryGetValue(new HttpRequestOptionsKey<string>(HttpRequestMessageOptions.RelativePathTemplate), out var route))
             fields.Add(new("http_route", route));
         return new MonitoredContent(content,

@@ -1,11 +1,19 @@
 using System.Collections.Concurrent;
+using System.Net;
 using System.Text;
 using System.Text.Json;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.AspNetCore.Routing.Patterns;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Refit;
 using Sentry;
+using Sentry.AspNetCore;
 using Sentry.Extensions.Logging;
 using Sentry.Extensibility;
 using Sentry.Protocol.Envelopes;
@@ -129,6 +137,236 @@ public sealed class SentryTelemetryTests
         var error = entry.RootElement.GetProperty("exception").GetProperty("values")[0];
         error.GetProperty("type").GetString().ShouldBe(typeof(HttpRequestException).FullName);
         error.GetProperty("stacktrace").GetProperty("frames").GetArrayLength().ShouldBeGreaterThan(0);
+    }
+
+    [Fact]
+    public async Task RefitFailure_ExportsSafeDependencyAndBusinessContext()
+    {
+        var transport = new RecordingTransport();
+        var builder = CreateBuilder(transport);
+        builder.AddOpenObservability();
+        using var host = builder.Build();
+        var logger = host.Services.GetRequiredService<ILogger<SentryTelemetryTests>>();
+        using var request = new HttpRequestMessage(HttpMethod.Post,
+            "https://private-user:private-password@service.test:8443/users/private-id?token=private-query");
+        request.Options.Set(new HttpRequestOptionsKey<string>(HttpRequestMessageOptions.RelativePathTemplate), "/users/{id}");
+        request.Options.Set(new HttpRequestOptionsKey<Type>(HttpRequestMessageOptions.InterfaceType), typeof(SentryTelemetryTests));
+        request.Headers.Add("Authorization", "Bearer private-authorization");
+        using var response = new HttpResponseMessage(HttpStatusCode.OK)
+        { Content = new StringContent("{\"access_token\":\"private-body\"}") };
+        var failure = await ApiException.Create("private-refit-message", request, request.Method, response, new RefitSettings(),
+            new JsonException("private-json", "$.private-path", 2, 3));
+
+        using (logger.BeginOperation("profile.exchange"))
+            logger.LogEvent(LogLevel.Error, "profile.exchange.failed", failure,
+                "Operation failed with {error_code}", "invalid_response");
+        await SentrySdk.FlushAsync(TimeSpan.FromSeconds(5));
+
+        var payload = transport.Payloads.Where(value => value.Contains("profile.exchange.failed")).ShouldHaveSingleItem();
+        payload.ShouldNotContain("private-");
+        payload.ShouldContain("profile.exchange");
+        using var entry = JsonDocument.Parse(payload.Split('\n')[2]);
+        var tags = entry.RootElement.GetProperty("tags");
+        tags.GetProperty("dependency_address").GetString().ShouldBe("service.test");
+        tags.GetProperty("dependency_port").GetString().ShouldBe("8443");
+        tags.GetProperty("dependency_http_route").GetString().ShouldBe("/users/{id}");
+        tags.GetProperty("upstream_status_code").GetString().ShouldBe("200");
+        tags.GetProperty("failure_kind").GetString().ShouldBe("response_deserialization");
+        tags.GetProperty("error_code").GetString().ShouldBe("invalid_response");
+    }
+
+    [Fact]
+    public async Task CanceledRequest_KeepsItsProvenCancellationSourceInSentryDiagnostics()
+    {
+        var transport = new RecordingTransport();
+        var builder = CreateBuilder(transport);
+        builder.AddOpenObservability();
+        using var host = builder.Build();
+        var logger = host.Services.GetRequiredService<ILogger<SentryTelemetryTests>>();
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var accessor = host.Services.GetRequiredService<IHttpContextAccessor>();
+        accessor.HttpContext = new DefaultHttpContext { RequestAborted = cancellation.Token };
+        try
+        {
+            logger.LogError(new OperationCanceledException("private-message", cancellation.Token), "Request canceled");
+            await SentrySdk.FlushAsync(TimeSpan.FromSeconds(5));
+
+            var payload = transport.Payloads.Where(value => value.Contains("Request canceled")).ShouldHaveSingleItem();
+            payload.ShouldNotContain("private-");
+            using var entry = JsonDocument.Parse(payload.Split('\n')[2]);
+            entry.RootElement.GetProperty("tags").GetProperty("cancellation_source").GetString().ShouldBe("request_aborted");
+            entry.RootElement.GetProperty("extra").GetProperty("cancellation_source").GetString().ShouldBe("request_aborted");
+        }
+        finally { accessor.HttpContext = null; }
+    }
+
+    [Fact]
+    public async Task Breadcrumbs_AreBoundedAndContainOnlyApprovedStructuredFields()
+    {
+        var transport = new RecordingTransport();
+        var builder = CreateBuilder(transport);
+        builder.AddOpenObservability();
+        using var host = builder.Build();
+        var logger = host.Services.GetRequiredService<ILogger<SentryTelemetryTests>>();
+        using var scope = SentrySdk.PushScope();
+        for (var attempt = 0; attempt < 35; attempt++)
+            logger.LogEvent(LogLevel.Information, "dependency.request.completed",
+                "private-message {retry_attempt} {dependency_address} {duration_ms} {payload} {RequestBody}",
+                attempt, "service.test", 12.5, "private-payload", "private-body");
+        logger.LogInformation("private-unstructured {payload}", "private-value");
+        SentrySdk.AddBreadcrumb("private-sdk-message", data: new Dictionary<string, string>
+        {
+            ["url"] = "https://service.test/private-path?token=private-query",
+            ["Authorization"] = "private-authorization"
+        });
+        var timestamp = new DateTimeOffset(2026, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var breadcrumb = Breadcrumb.FromJson(JsonSerializer.SerializeToElement(new
+        {
+            timestamp,
+            message = "private-message",
+            data = new Dictionary<string, string>
+            {
+                ["operation"] = "profile.update",
+                ["error_code"] = "version_conflict",
+                ["payload"] = "private-data",
+                ["dependency_http_route"] = new string('x', 257)
+            }
+        }));
+        SentrySdk.AddBreadcrumb(breadcrumb);
+
+        using (logger.BeginOperation("profile.update"))
+            logger.LogError("Capture breadcrumb check");
+        await SentrySdk.FlushAsync(TimeSpan.FromSeconds(5));
+
+        var payload = transport.Payloads.Where(value => value.Contains("Capture breadcrumb check")).ShouldHaveSingleItem();
+        payload.ShouldNotContain("private-");
+        using var entry = JsonDocument.Parse(payload.Split('\n')[2]);
+        var crumbs = entry.RootElement.GetProperty("breadcrumbs").EnumerateArray().ToArray();
+        crumbs.Length.ShouldBe(30);
+        var first = crumbs[0].GetProperty("data");
+        first.GetProperty("retry_attempt").GetString().ShouldBe("6");
+        first.GetProperty("duration_ms").GetString().ShouldBe("12.5");
+        first.GetProperty("dependency_address").GetString().ShouldBe("service.test");
+        var last = crumbs[^1].GetProperty("data");
+        crumbs[^1].GetProperty("timestamp").GetDateTimeOffset().ShouldBe(timestamp);
+        last.GetProperty("operation").GetString().ShouldBe("profile.update");
+        last.GetProperty("error_code").GetString().ShouldBe("version_conflict");
+        last.TryGetProperty("dependency_http_route", out _).ShouldBeFalse();
+    }
+
+    [Fact]
+    public async Task ParallelRequests_KeepSafeRequestContextAndBreadcrumbsInTheirOwnScopes()
+    {
+        var transport = new RecordingTransport();
+        var builder = CreateBuilder(transport);
+        builder.AddOpenObservability();
+        using var host = builder.Build();
+        var logger = host.Services.GetRequiredService<ILogger<SentryTelemetryTests>>();
+        var arrived = 0;
+        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var middleware = new CorrelationMiddleware(async context =>
+        {
+            var index = (int)context.Items["index"]!;
+            logger.LogEvent(LogLevel.Information, "operation.updated", "Step {operation} {payload}",
+                $"step.{index}", "private-step-data");
+            if (Interlocked.Increment(ref arrived) == 2)
+                ready.SetResult();
+            await ready.Task.WaitAsync(TimeSpan.FromSeconds(5), TestContext.Current.CancellationToken);
+            if (index == 0)
+                logger.LogError(CreateFailure(), "Parallel request {request_id}", index);
+            else
+                SentrySdk.CaptureException(CreateFailure());
+        }, host.Services.GetRequiredService<ILogger<CorrelationMiddleware>>());
+
+        await Task.WhenAll(Enumerable.Range(0, 2).Select(index => Task.Run(async () =>
+        {
+            var context = new DefaultHttpContext { RequestServices = host.Services };
+            context.Items["index"] = index;
+            context.Request.Method = index == 0 ? "POST" : "PATCH";
+            context.Request.Path = "/users/private-id";
+            context.Request.QueryString = new QueryString("?token=private-query");
+            context.SetEndpoint(new RouteEndpoint(_ => Task.CompletedTask,
+                RoutePatternFactory.Parse($"/users{index}/{{id}}"), 0, EndpointMetadataCollection.Empty, "users"));
+            await middleware.Invoke(context);
+        }, TestContext.Current.CancellationToken)));
+        logger.LogError("After requests");
+        await SentrySdk.FlushAsync(TimeSpan.FromSeconds(5));
+
+        var entries = transport.Payloads.Select(payload => JsonDocument.Parse(payload.Split('\n')[2])).ToArray();
+        try
+        {
+            entries.Length.ShouldBe(3);
+            foreach (var entry in entries.Where(entry => entry.RootElement.TryGetProperty("exception", out _)))
+            {
+                var root = entry.RootElement;
+                var index = root.GetProperty("request").GetProperty("method").GetString() == "POST" ? 0 : 1;
+                root.GetProperty("request").GetProperty("other").GetProperty("route").GetString().ShouldBe($"/users{index}/{{id}}");
+                var tags = root.GetProperty("tags");
+                tags.GetProperty("trace_id").GetString()!.Length.ShouldBe(32);
+                tags.GetProperty("span_id").GetString()!.Length.ShouldBe(16);
+                var crumbs = root.GetProperty("breadcrumbs").EnumerateArray().ToArray();
+                crumbs.ShouldHaveSingleItem().GetProperty("data").GetProperty("operation").GetString().ShouldBe($"step.{index}");
+                root.GetRawText().ShouldNotContain("private-");
+            }
+            var after = entries.Single(entry => entry.RootElement.TryGetProperty("logentry", out var log)
+                && log.GetProperty("message").GetString() == "After requests");
+            after.RootElement.GetProperty("request").EnumerateObject().ShouldBeEmpty();
+            after.RootElement.TryGetProperty("breadcrumbs", out _).ShouldBeFalse();
+        }
+        finally
+        {
+            foreach (var entry in entries)
+                entry.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task UnhandledHttpFailure_PreservesSafeContextInTheOfficialAspNetCoreCapture()
+    {
+        var transport = new RecordingTransport();
+        var builder = WebApplication.CreateBuilder();
+        builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Loopback, 0));
+        builder.Configuration.AddInMemoryCollection(new Dictionary<string, string?>
+        {
+            ["Observability:Logging:ConsoleEnabled"] = "false",
+            ["Sentry:Dsn"] = "https://public@example.test/1",
+            ["Logging:LogLevel:Microsoft.AspNetCore.Hosting.Diagnostics"] = "Critical"
+        });
+        builder.Services.Configure<SentryAspNetCoreOptions>(options =>
+        {
+            options.Transport = transport;
+            options.AutoSessionTracking = false;
+        });
+        builder.AddOpenObservability();
+        await using var server = builder.Build();
+        server.UseRouting();
+        server.UseOpenObservability();
+        server.MapGet("/users/{id}", async context =>
+        {
+            await Task.Yield();
+            context.RequestServices.GetRequiredService<ILogger<SentryTelemetryTests>>()
+                .LogEvent(LogLevel.Information, "operation.updated", "Step {operation} {payload}",
+                    "profile.read", "private-step");
+            throw new InvalidOperationException("private-exception");
+        });
+        await server.StartAsync(TestContext.Current.CancellationToken);
+        using var client = new HttpClient();
+
+        using var response = await client.GetAsync(server.Urls.Single() + "/users/private-id?token=private-query",
+            TestContext.Current.CancellationToken);
+        response.StatusCode.ShouldBe(HttpStatusCode.InternalServerError);
+        await SentrySdk.FlushAsync(TimeSpan.FromSeconds(5));
+
+        var payload = transport.Payloads.Where(value => value.Contains("SentryMiddleware.UnhandledException")).ShouldHaveSingleItem();
+        payload.ShouldNotContain("private-");
+        using var entry = JsonDocument.Parse(payload.Split('\n')[2]);
+        var root = entry.RootElement;
+        root.GetProperty("request").GetProperty("method").GetString().ShouldBe("GET");
+        root.GetProperty("request").GetProperty("other").GetProperty("route").GetString().ShouldBe("/users/{id}");
+        root.GetProperty("breadcrumbs").EnumerateArray().Any(crumb =>
+            crumb.GetProperty("data").TryGetProperty("operation", out var operation) && operation.GetString() == "profile.read")
+            .ShouldBeTrue();
     }
 
     [Fact]
