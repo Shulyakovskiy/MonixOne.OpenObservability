@@ -1,3 +1,6 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.Extensions.Configuration;
@@ -14,12 +17,15 @@ namespace MonixOne.OpenObservability;
 /// </summary>
 internal static class SentryConfiguration
 {
-    private static readonly AsyncLocal<Exception?> _loggedException = new();
+    private static readonly AsyncLocal<LogContext?> _currentLog = new();
 
-    internal static Exception? LoggedException
+    internal sealed record LogContext(Exception? Exception, EventId EventId,
+        IReadOnlyList<KeyValuePair<string, object?>>? Attributes);
+
+    internal static LogContext? CurrentLog
     {
-        get => _loggedException.Value;
-        set => _loggedException.Value = value;
+        get => _currentLog.Value;
+        set => _currentLog.Value = value;
     }
 
     internal static void AddSentryTelemetry(this IHostApplicationBuilder builder)
@@ -44,11 +50,12 @@ internal static class SentryConfiguration
             options.Dsn = dsn;
             options.Environment = builder.Environment.EnvironmentName;
             options.SendDefaultPii = false;
-            options.MaxBreadcrumbs = 0;
+            options.MaxBreadcrumbs = 30;
             options.ShutdownTimeout = TimeSpan.FromSeconds(5);
+            options.SetBeforeBreadcrumb(SanitizeBreadcrumb);
             options.SetBeforeSend(entry =>
             {
-                if (entry.Exception is not null || LoggedException is not { } loggedException)
+                if (entry.Exception is not null || CurrentLog is not { Exception: { } loggedException } log)
                     return SanitizeEvent(entry);
 
                 // The provider receives sanitized ILogger state and no raw exception.
@@ -57,20 +64,21 @@ internal static class SentryConfiguration
                 var logTags = entry.Tags.ToArray();
                 foreach (var processor in options.GetAllExceptionProcessors())
                     processor.Process(loggedException, entry);
-                SanitizeEvent(entry, loggedException);
+                SanitizeEvent(entry, loggedException, log.Attributes);
                 foreach (var field in logFields)
                     entry.SetExtra(field.Key, field.Value);
                 foreach (var tag in logTags)
                     entry.SetTag(tag.Key, tag.Value);
+                SanitizeRequest(entry);
                 return entry;
             });
             options.SetBeforeSendTransaction(SanitizeTransaction);
         }
     }
 
-    internal static SentryEvent SanitizeEvent(SentryEvent entry, Exception? loggedException = null)
+    internal static SentryEvent SanitizeEvent(SentryEvent entry, Exception? loggedException = null,
+        IReadOnlyList<KeyValuePair<string, object?>>? logAttributes = null)
     {
-        entry.Request = new SentryRequest();
         entry.User = new SentryUser();
         foreach (var error in entry.SentryExceptions ?? [])
         {
@@ -103,10 +111,78 @@ internal static class SentryConfiguration
                         entry.Contexts.Remove(name["sentry:context:".Length..]);
                 }
             foreach (var attribute in ExceptionDiagnosticsExtensions.CreateAttributes(exception))
-                entry.SetExtra(attribute.Key, attribute.Value);
+                entry.SetExtra(attribute.Key,
+                    logAttributes?.LastOrDefault(field => field.Key == attribute.Key).Value ?? attribute.Value);
         }
+        SanitizeRequest(entry);
         return entry;
     }
+
+    private static void SanitizeRequest(SentryEvent entry)
+    {
+        entry.Request = new SentryRequest
+        {
+            Method = entry.Tags.GetValueOrDefault("http_method") ?? entry.Request.Method
+        };
+        if (entry.Tags.TryGetValue("http_route", out var route))
+            entry.Request.Other["route"] = route;
+    }
+
+    private static Breadcrumb? SanitizeBreadcrumb(Breadcrumb breadcrumb)
+    {
+        // SDK scope cloning invokes this hook again for breadcrumbs already sanitized here.
+        var log = breadcrumb.Category == "diagnostics" ? null : CurrentLog;
+        if (log?.EventId.Name is "http.client.request.body" or "http.client.response.body")
+            return null;
+
+        var data = new Dictionary<string, string>();
+        if (log is not null)
+        {
+            foreach (var attribute in log.Attributes ?? [])
+                Add(attribute.Key == "Duration" ? "duration_ms" : attribute.Key, attribute.Value);
+            if (!string.IsNullOrWhiteSpace(log.EventId.Name))
+                Add("event_name", log.EventId.Name == "RequestResponseLog" ? "http.request.completed" : log.EventId.Name);
+            if (Activity.Current is { } activity)
+            {
+                Add("trace_id", activity.TraceId.ToString());
+                Add("span_id", activity.SpanId.ToString());
+            }
+        }
+        else if (breadcrumb.Data is { } fields)
+            foreach (var field in fields)
+                Add(field.Key, field.Value);
+
+        // Correlation alone is not a useful step. Never retain formatted messages or raw SDK HTTP data.
+        if (!data.Keys.Any(key => key is not "trace_id" and not "span_id"))
+            return null;
+        // Breadcrumb is immutable; the SDK's JSON factory preserves its original timestamp.
+        return Breadcrumb.FromJson(JsonSerializer.SerializeToElement(new
+        {
+            timestamp = breadcrumb.Timestamp,
+            message = data.GetValueOrDefault("event_name") ?? "diagnostic.step",
+            type = "default",
+            data,
+            category = "diagnostics",
+            level = breadcrumb.Level.ToString().ToUpperInvariant()
+        }));
+
+        void Add(string key, object? value)
+        {
+            if (!IsBreadcrumbField(key) || value is not (string or bool or int or long or double or float or decimal))
+                return;
+            var text = Convert.ToString(value, CultureInfo.InvariantCulture);
+            if (!string.IsNullOrWhiteSpace(text) && text.Length <= 256)
+                data[key] = text;
+        }
+    }
+
+    private static bool IsBreadcrumbField(string key) => key is
+        "event_name" or "operation" or "error_code" or "failure_kind" or "http_request_error" or "socket_error_code"
+        or "exception.type" or "json_error_line" or "json_error_byte_position"
+        or "http_method" or "http_route" or "http_status_code" or "http_response_status_code_at_log" or "http_response_started"
+        or "dependency_address" or "dependency_port" or "dependency_http_method" or "dependency_http_route" or "dependency_client"
+        or "upstream_status_code" or "duration_ms" or "retry_attempt" or "retry_delay_ms" or "timeout_ms"
+        or "cancellation_source" or "circuit_state" or "trace_id" or "span_id";
 
     internal static SentryTransaction SanitizeTransaction(SentryTransaction transaction)
     {

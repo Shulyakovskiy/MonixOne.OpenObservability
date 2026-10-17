@@ -40,10 +40,12 @@ public sealed class TelemetryRegistrationTests
     {
         var failure = new InvalidOperationException("private-exception-message");
         failure.Data["payload"] = "private-exception-data";
+        failure.Data["sentry:tag:http_route"] = "private-route";
         var entry = new SentryEvent(failure)
         {
             Request = new SentryRequest
             {
+                Method = "POST",
                 Url = "https://service.test/private-path?token=private-query",
                 Data = "private-body",
                 Headers = { ["Authorization"] = "private-header" }
@@ -52,6 +54,7 @@ public sealed class TelemetryRegistrationTests
             SentryExceptions = [new SentryException { Type = nameof(InvalidOperationException), Value = failure.Message }]
         };
         entry.SetExtra("payload", "private-extra");
+        entry.SetTag("http_route", "private-route");
 
         var sanitized = SentryConfiguration.SanitizeEvent(entry);
         using var stream = new MemoryStream();
@@ -62,6 +65,9 @@ public sealed class TelemetryRegistrationTests
         json.ShouldNotContain("private-");
         json.ShouldContain("InvalidOperationException");
         json.ShouldContain("exception_root_type");
+        using var document = JsonDocument.Parse(json);
+        document.RootElement.GetProperty("request").GetProperty("method").GetString().ShouldBe("POST");
+        document.RootElement.GetProperty("request").TryGetProperty("other", out _).ShouldBeFalse();
     }
 
     private sealed class MetricExporter : BaseExporter<Metric>

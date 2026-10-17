@@ -44,7 +44,7 @@ ASP.NET Core и `HttpClient` используют стандартный `tracep
 
 ```xml
 <ItemGroup>
-    <PackageVersion Include="MonixOne.OpenObservability" Version="1.0.2" />
+    <PackageVersion Include="MonixOne.OpenObservability" Version="1.0.3" />
 </ItemGroup>
 ```
 
@@ -200,6 +200,20 @@ Observability__Logging__ConsoleEnabled=false
 `IHttpClientFactory`, включая Refit и OAuth backchannel.
 Тела передаются в лог через адаптер `HttpContent` и библиотечный `MonitoringStream`.
 
+HTTP-метаданные, body-события и исключения Refit содержат безопасный контекст зависимости:
+
+| Поле | Содержимое |
+| --- | --- |
+| `dependency_address`, `dependency_port` | Host и port без userinfo, path, query и fragment |
+| `dependency_http_method` | Метод исходящего запроса |
+| `dependency_http_route` | Шаблон маршрута из Refit, если доступен |
+| `dependency_client` | Полное имя интерфейса Refit, если доступно |
+| `upstream_status_code` | Полученный HTTP status; при транспортном сбое без ответа отсутствует или `null` |
+
+`ApiRequestException` также сохраняет контекст зависимости при DNS, TLS и других
+транспортных сбоях. Из `HttpRequestException` без Refit нельзя восстановить адрес
+зависимости: используйте связанное исходящее HTTP-событие или scope приложения.
+
 Транспортные HTTP-клиенты OTLP-exporters исключены из HTTP-логирования приложения
 и захвата тел. Это сохраняет синхронную отправку и настройки транспорта SDK
 и не создаёт HTTP-логи о передаче самой телеметрии.
@@ -322,15 +336,36 @@ logger.LogEvent(
 | `exception_type` | Тип переданного исключения |
 | `exception_inner_type` | Тип непосредственного `InnerException` |
 | `exception_root_type` | Тип корневого исключения |
+| `exception.type` | Полное имя типа переданного исключения |
 | `exception_stack_trace` | Типы и стеки цепочки без сообщений исключений |
 | `failure_kind` | Классификация сбоя |
-| `status_code` | HTTP status из Refit `ApiException` или `HttpRequestException` |
+| `status_code`, `upstream_status_code` | HTTP status зависимости из Refit `ApiException` или `HttpRequestException`; `status_code` сохранён для совместимости |
+| `http_request_error` | Категория `HttpRequestError` из `HttpRequestException` или `HttpIOException`, если известна |
+| `socket_error_code` | Код `SocketException`, если найден |
+| `cancellation_source` | Для timeout/cancellation: `timeout`, `request_aborted` или `unknown` |
 | `json_error_line` | Строка ошибки JSON |
 | `json_error_byte_position` | Позиция ошибки JSON в байтах |
-| `http_method`, `http_route`, `http_status_code` | Метод, шаблон маршрута и текущий response status при доступном HTTP-контексте |
+| `http_method`, `http_route` | Метод и шаблон входящего маршрута при доступном HTTP-контексте |
+| `http_response_status_code_at_log` | Снимок status входящего ответа в момент логирования исключения |
+| `http_response_started` | Были ли уже отправлены заголовки входящего ответа |
+
+`http_status_code` в событии `http.request.completed` — итоговый статус запроса
+в пределах HTTP Logging middleware. Обработчик ошибок приложения должен находиться
+внутри него, как в примере подключения. Лог исключения не публикует этот статус:
+его `http_response_status_code_at_log` ещё может быть `200`, хотя обработчик затем
+вернёт `500`. Статус зависимости хранится отдельно в `upstream_status_code`.
+
+Отмена входящего запроса определяется по совпадению отменённого token исключения
+с `HttpContext.RequestAborted`. Для linked/пользовательского token и остановки host,
+происхождение которых нельзя доказать по доступному контексту, сохраняется `unknown`.
+Наличие `TimeoutException` или Polly timeout классифицируется
+как `timeout`, в том числе внутри `TaskCanceledException` от `HttpClient`.
 
 `JsonException` распознаётся во всей `InnerException`-цепочке и во всех ветках
 `AggregateException`, в том числе при вложенном `FormatException`.
+`JsonException.Path` не экспортируется: имена динамических JSON-ключей могут содержать
+персональные данные. Статическое имя контракта/DTO при необходимости добавляйте
+в структурированные поля бизнес-лога.
 
 ### Классификация сбоев
 
@@ -338,12 +373,16 @@ logger.LogEvent(
 
 | failure_kind | Условие |
 | --- | --- |
-| `response_deserialization` | Найден `JsonException`, в том числе при HTTP 200 |
+| `response_deserialization` | Найден `ApiException`, содержащий `JsonException` в собственной цепочке, в том числе при HTTP 200 |
+| `json` | Остальные JSON-сбои: направление и источник не предполагаются |
 | `timeout` | Найден `TimeoutException` или Polly `TimeoutRejectedException` |
 | `canceled` | Найден `OperationCanceledException` |
 | `http_status` | HTTP status не меньше 400 |
-| `transport` | Найден `HttpRequestException` без предыдущих условий |
+| `transport` | Найден `HttpRequestException`, `HttpIOException` или `SocketException` без предыдущих условий |
 | `application` | Остальные исключения |
+
+HTTP-исключение и JSON-сбой в разных ветках `AggregateException` не считаются
+доказательством ошибки десериализации HTTP-ответа.
 
 Сырые объекты `Exception` не передаются providers: `ApiException.ToString()` может
 содержать полное HTTP-тело. Экспортируются типы, классификация и стеки без
@@ -423,7 +462,8 @@ Sentry__TracesSampleRate=0.0
 Штатные exception processors SDK сохраняют типы исключений и stack frames.
 Перед отправкой пакет очищает:
 
-- request/user данные и сообщения исключений;
+- request/user данные и сообщения исключений; сохраняются только HTTP method
+  и route template в `request.other.route`, когда он доступен из контекста пакета;
 - значения локальных переменных stack frames;
 - `Exception.Data`, включая проекции в mechanism, tags и contexts;
 - HTTP URL в span data/tags, HTTP span descriptions и URL transaction names.
@@ -434,21 +474,68 @@ Sentry__TracesSampleRate=0.0
 | --- | --- |
 | `Environment` | Окружение приложения из host environment |
 | `SendDefaultPii` | `false` |
-| `MaxBreadcrumbs` | `0` |
+| `MaxBreadcrumbs` | `30` |
 | `MaxRequestBodySize` для ASP.NET Core | `None` |
 | `ShutdownTimeout` | 5 секунд |
 
 HTTP-тела доступны в очищенных OpenTelemetry-логах.
 Завершение SDK и flush выполняются через lifecycle host.
 
+### Безопасная история перед ошибкой
+
+Sentry хранит до 30 последних breadcrumbs. Штатный `BeforeBreadcrumb` callback
+создаёт их заново из разрешённых структурированных полей; форматированное сообщение
+не сохраняется, исходное время шага сохраняется при копировании scopes.
+HTTP-запросы получают отдельный Sentry scope, чтобы контекст и история
+параллельных запросов не смешивались. В worker services задавайте отдельный scope
+для каждой обработки сообщения/задачи.
+
+Разрешены:
+
+- `event_name`, `operation`, `error_code`, `failure_kind`, `exception.type`;
+- HTTP method/route/status, снимок статуса ответа и `http_response_started`;
+- `dependency_address`, `dependency_port`, `dependency_http_method`,
+  `dependency_http_route`, `dependency_client`, `upstream_status_code`;
+- `http_request_error`, `socket_error_code`, `cancellation_source`, JSON line/byte position;
+- `duration_ms`, `retry_attempt`, `retry_delay_ms`, `timeout_ms`, `circuit_state`;
+- `trace_id`, `span_id`.
+
+Значения должны быть строками или простыми числовыми/boolean значениями; строки
+длиннее 256 символов пропускаются. URL, заголовки, payload, сообщения исключений,
+произвольные объекты и HTTP body-события в breadcrumbs не включаются. Шаги без
+разрешённых данных, кроме одной корреляции, отбрасываются.
+
+`LogEvent()` передаёт стабильное имя события. Остальные поля breadcrumbs берутся
+из состояния конкретного вызова `ILogger`; scopes продолжают обогащать само событие Sentry.
+Используйте имена операций, коды ошибок, route templates и значения состояния,
+заданные кодом, без пользовательского содержимого:
+
+```csharp
+logger.LogEvent(
+    LogLevel.Warning,
+    "dependency.retry.scheduled",
+    "Retry {retry_attempt} for {operation} after {retry_delay_ms} ms; timeout {timeout_ms} ms",
+    attempt,
+    "profile.exchange",
+    delay.TotalMilliseconds,
+    timeout.TotalMilliseconds);
+```
+
+Retry/timeout/circuit поля записывайте там, где настроена соответствующая политика.
+Пакет не создаёт retries и не предполагает их наличие.
+
 ## Расследование инцидентов
 
 1. Найдите бизнес-ошибку по `event_name` и определите её `trace_id`.
 2. Найдите входящий HTTP-лог и spans с тем же `trace_id`.
 3. Сопоставьте исходящие HTTP-метаданные и body-события.
-4. Проверьте status, content type/length, `RequestBody`, `ResponseBody` и `failure_kind`.
-5. Для ошибок JSON проверьте позицию десериализации; для остальных сбоев — типы и стеки,
-   в том числе в связанном событии Sentry.
+4. Сопоставьте итоговый `http_status_code` входящего запроса с `upstream_status_code`
+   зависимости; снимок `http_response_status_code_at_log` может отличаться от итогового.
+5. Проверьте `dependency_*`, `failure_kind`, `http_request_error`, `socket_error_code`,
+   content type/length, `RequestBody` и `ResponseBody`.
+6. Для JSON проверьте категорию и line/byte position; для отмены — `cancellation_source`;
+   для остальных сбоев — типы и стеки. В Sentry используйте безопасные breadcrumbs
+   для последовательности операций и повторов перед ошибкой.
 
 | event_name | Данные |
 | --- | --- |

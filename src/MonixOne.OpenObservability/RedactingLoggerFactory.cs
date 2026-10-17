@@ -1,6 +1,7 @@
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.Logging;
+using Sentry;
 
 namespace MonixOne.OpenObservability;
 
@@ -8,7 +9,8 @@ namespace MonixOne.OpenObservability;
 /// Passes sanitized HTTP bodies and automatic exception diagnostics to every provider.
 /// HTTP capture, filtering, scopes and export remain owned by the existing loggers.
 /// </summary>
-internal sealed class RedactingLoggerFactory(ILoggerFactory inner, HttpBodySanitizer sanitizer, IHttpContextAccessor httpContextAccessor) : ILoggerFactory
+internal sealed class RedactingLoggerFactory(ILoggerFactory inner, HttpBodySanitizer sanitizer,
+    IHttpContextAccessor httpContextAccessor) : ILoggerFactory
 {
     public ILogger CreateLogger(string categoryName)
     {
@@ -42,42 +44,28 @@ internal sealed class RedactingLoggerFactory(ILoggerFactory inner, HttpBodySanit
         {
             if (!IsEnabled(logLevel))
                 return;
-            var previousException = SentryConfiguration.LoggedException;
-            if (ReferenceEquals(previousException, exception))
-            {
-                LogCore(logLevel, eventId, state, exception, formatter);
-                return;
-            }
-            try
-            {
-                SentryConfiguration.LoggedException = exception;
-                LogCore(logLevel, eventId, state, exception, formatter);
-            }
-            finally { SentryConfiguration.LoggedException = previousException; }
-        }
-
-        private void LogCore<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception,
-            Func<TState, Exception?, string> formatter)
-        {
             var attributes = state as IReadOnlyList<KeyValuePair<string, object?>>
                              ?? (state as IEnumerable<KeyValuePair<string, object?>>)?.ToList();
             var hasBody = httpLogger && attributes?.Any(attribute => IsBody(attribute.Key)) == true;
             var hasRawUrl = hostingLogger && attributes?.Any(attribute => IsRawUrlField(attribute.Key)) == true;
             if (!hasBody && !hasRawUrl && exception is null)
             {
-                innerLogger.Log(logLevel, eventId, state, exception, formatter);
+                WriteLog(logLevel, eventId, state, formatter, null, attributes);
                 return;
             }
 
             var safeState = attributes?.ToList() ?? [];
             if (exception is not null)
             {
-                var diagnostics = ExceptionDiagnosticsExtensions.CreateAttributes(exception);
+                var diagnostics = ExceptionDiagnosticsExtensions.CreateAttributes(exception,
+                    accessor.HttpContext?.RequestAborted ?? default);
                 if (accessor.HttpContext is { } context)
                 {
                     diagnostics.Add(new("http_method", context.Request.Method));
                     diagnostics.Add(new("http_route", (context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText ?? "{unmatched}"));
-                    diagnostics.Add(new("http_status_code", context.Response.StatusCode));
+                    // The exception handler may still change the response after this log.
+                    diagnostics.Add(new("http_response_status_code_at_log", context.Response.StatusCode));
+                    diagnostics.Add(new("http_response_started", context.Response.HasStarted));
                 }
                 foreach (var diagnostic in diagnostics)
                 {
@@ -114,7 +102,25 @@ internal sealed class RedactingLoggerFactory(ILoggerFactory inner, HttpBodySanit
 
             // ApiException.ToString() can include the raw HTTP response.
             // Providers receive type, classification and stacks instead of that object.
-            innerLogger.Log(logLevel, eventId, safeState, exception: null, (_, _) => message);
+            WriteLog(logLevel, eventId, safeState, (_, _) => message, exception, safeState);
+        }
+
+        private void WriteLog<TState>(LogLevel logLevel, EventId eventId, TState state,
+            Func<TState, Exception?, string> formatter, Exception? originalException,
+            IReadOnlyList<KeyValuePair<string, object?>>? attributes)
+        {
+            if (!SentrySdk.IsEnabled)
+            {
+                innerLogger.Log(logLevel, eventId, state, exception: null, formatter);
+                return;
+            }
+            var previous = SentryConfiguration.CurrentLog;
+            try
+            {
+                SentryConfiguration.CurrentLog = new(originalException, eventId, attributes);
+                innerLogger.Log(logLevel, eventId, state, exception: null, formatter);
+            }
+            finally { SentryConfiguration.CurrentLog = previous; }
         }
 
         private static bool IsBody(string key) =>

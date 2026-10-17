@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Sockets;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.Routing.Patterns;
@@ -24,7 +25,11 @@ public sealed class ExceptionDiagnosticsTests
     {
         using var logs = new RecordingProvider();
         using var host = CreateHost(logs);
-        using var request = new HttpRequestMessage(HttpMethod.Post, "https://service.test/session");
+        using var request = new HttpRequestMessage(HttpMethod.Post,
+            "https://private-user:private-password@service.test:8443/session/private-id?token=private-query#private-fragment");
+        request.Options.Set(new HttpRequestOptionsKey<string>(HttpRequestMessageOptions.RelativePathTemplate), "/session/{id}");
+        request.Options.Set(new HttpRequestOptionsKey<Type>(HttpRequestMessageOptions.InterfaceType), typeof(ExceptionDiagnosticsTests));
+        request.Headers.Add("Authorization", "Bearer private-authorization");
         using var response = new HttpResponseMessage(HttpStatusCode.OK)
         { Content = new StringContent("{\"access_token\":\"private-response-token\"}") };
         var exception = await ApiException.Create("private-refit-message", request, HttpMethod.Post,
@@ -38,6 +43,12 @@ public sealed class ExceptionDiagnosticsTests
         entry.Exception.ShouldBeNull();
         entry.Text.ShouldNotContain("private-");
         entry.Attributes.ShouldContain(pair => pair.Key == "status_code" && Equals(pair.Value, 200));
+        entry.Attributes.ShouldContain(pair => pair.Key == "upstream_status_code" && Equals(pair.Value, 200));
+        entry.Attributes.ShouldContain(pair => pair.Key == "dependency_address" && Equals(pair.Value, "service.test"));
+        entry.Attributes.ShouldContain(pair => pair.Key == "dependency_port" && Equals(pair.Value, 8443));
+        entry.Attributes.ShouldContain(pair => pair.Key == "dependency_http_route" && Equals(pair.Value, "/session/{id}"));
+        entry.Attributes.ShouldContain(pair => pair.Key == "dependency_http_method" && Equals(pair.Value, "POST"));
+        entry.Attributes.ShouldContain(pair => pair.Key == "dependency_client" && Equals(pair.Value, typeof(ExceptionDiagnosticsTests).FullName));
         entry.Attributes.ShouldContain(pair => pair.Key == "failure_kind" && Equals(pair.Value, "response_deserialization"));
         entry.Attributes.ShouldContain(pair => pair.Key == "exception_root_type"
             && Equals(pair.Value, nested ? nameof(FormatException) : nameof(JsonException)));
@@ -72,8 +83,10 @@ public sealed class ExceptionDiagnosticsTests
         entry.Attributes.ShouldContain(pair => pair.Key == "failure_kind" && Equals(pair.Value, expected));
     }
 
-    [Fact]
-    public void OrdinaryLogError_AddsCurrentHttpRouteAndFinalStatusWithoutManualScope()
+    [Theory]
+    [InlineData(200)]
+    [InlineData(409)]
+    public void OrdinaryLogError_SeparatesResponseSnapshotFromUpstreamStatus(int status)
     {
         using var logs = new RecordingProvider();
         using var host = CreateHost(logs);
@@ -81,17 +94,20 @@ public sealed class ExceptionDiagnosticsTests
         context.Request.Method = "POST";
         context.Request.Path = "/users/private-user";
         context.Request.QueryString = new QueryString("?token=private-query");
-        context.Response.StatusCode = 409;
+        context.Response.StatusCode = status;
         context.SetEndpoint(new RouteEndpoint(_ => Task.CompletedTask,
             RoutePatternFactory.Parse("/users/{id}"), 0, EndpointMetadataCollection.Empty, "users"));
         host.Services.GetRequiredService<IHttpContextAccessor>().HttpContext = context;
         try
         {
             host.Services.GetRequiredService<ILogger<ExceptionDiagnosticsTests>>()
-                .LogWarning(new InvalidOperationException("private-exception"), "Update rejected");
+                .LogWarning(new HttpRequestException("private-exception", null, HttpStatusCode.ServiceUnavailable), "Update rejected");
             var entry = logs.Entries.ShouldHaveSingleItem();
             entry.Attributes.ShouldContain(pair => pair.Key == "http_route" && Equals(pair.Value, "/users/{id}"));
-            entry.Attributes.ShouldContain(pair => pair.Key == "http_status_code" && Equals(pair.Value, 409));
+            entry.Attributes.ShouldContain(pair => pair.Key == "http_response_status_code_at_log" && Equals(pair.Value, status));
+            entry.Attributes.ShouldContain(pair => pair.Key == "http_response_started" && Equals(pair.Value, false));
+            entry.Attributes.ShouldContain(pair => pair.Key == "upstream_status_code" && Equals(pair.Value, 503));
+            entry.Attributes.ShouldNotContain(pair => pair.Key == "http_status_code");
             entry.Text.ShouldNotContain("private-");
         }
         finally { host.Services.GetRequiredService<IHttpContextAccessor>().HttpContext = null; }
@@ -156,8 +172,120 @@ public sealed class ExceptionDiagnosticsTests
 
         var entry = logs.Entries.ShouldHaveSingleItem();
         entry.Text.ShouldNotContain("private-");
-        entry.Attributes.ShouldContain(pair => pair.Key == "failure_kind" && Equals(pair.Value, "response_deserialization"));
+        entry.Attributes.ShouldContain(pair => pair.Key == "failure_kind" && Equals(pair.Value, "json"));
         entry.Attributes.ShouldContain(pair => pair.Key == "json_error_line" && Equals(pair.Value, 3L));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void JsonFailure_WithoutResponseEvidence_IsNeutral(bool incomingRequest)
+    {
+        var json = new JsonException("private-json", "$.private-path", 1, 2);
+        Exception error = incomingRequest ? new BadHttpRequestException("private-request", 400, json) : json;
+        var attributes = ExceptionDiagnosticsExtensions.CreateAttributes(error,
+            TestContext.Current.CancellationToken).ToDictionary();
+
+        attributes["failure_kind"].ShouldBe("json");
+        attributes["json_error_line"].ShouldBe(1L);
+        attributes.ShouldNotContain(pair => pair.Key == "json_error_path");
+        attributes["upstream_status_code"].ShouldBeNull();
+    }
+
+    [Fact]
+    public async Task AggregateFailure_DoesNotAssociateJsonWithAnUnrelatedHttpResponse()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://service.test/");
+        using var response = new HttpResponseMessage(HttpStatusCode.BadGateway);
+        var api = await ApiException.Create(request, request.Method, response, new RefitSettings());
+        var error = new AggregateException(api, new JsonException("private-json"));
+
+        ExceptionDiagnosticsExtensions.CreateAttributes(error,
+            TestContext.Current.CancellationToken).ToDictionary()["failure_kind"].ShouldBe("json");
+    }
+
+    [Theory]
+    [InlineData(HttpRequestError.NameResolutionError)]
+    [InlineData(HttpRequestError.ConnectionError)]
+    [InlineData(HttpRequestError.SecureConnectionError)]
+    [InlineData(HttpRequestError.ResponseEnded)]
+    public void TransportFailure_ReportsTypedReasonWithoutMessages(HttpRequestError reason)
+    {
+        var error = new HttpRequestException(reason, "private-message", new SocketException((int)SocketError.ConnectionRefused));
+        var attributes = ExceptionDiagnosticsExtensions.CreateAttributes(error,
+            TestContext.Current.CancellationToken).ToDictionary();
+
+        attributes["failure_kind"].ShouldBe("transport");
+        attributes["http_request_error"].ShouldBe(reason.ToString());
+        attributes["socket_error_code"].ShouldBe("ConnectionRefused");
+        attributes["exception.type"].ShouldBe(typeof(HttpRequestException).FullName);
+        string.Join(" ", attributes.Values).ShouldNotContain("private-");
+    }
+
+    [Fact]
+    public void StreamFailure_ReportsHttpIOExceptionReason()
+    {
+        var attributes = ExceptionDiagnosticsExtensions.CreateAttributes(
+            new HttpIOException(HttpRequestError.ResponseEnded, "private-message"),
+            TestContext.Current.CancellationToken).ToDictionary();
+
+        attributes["failure_kind"].ShouldBe("transport");
+        attributes["http_request_error"].ShouldBe("ResponseEnded");
+    }
+
+    [Fact]
+    public void RefitTransportFailure_RetainsDependencyWithoutAResponseStatus()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://service.test/private-path?token=private-query");
+        var error = new ApiRequestException(request, request.Method, new RefitSettings(),
+            new HttpRequestException(HttpRequestError.NameResolutionError, "private-dns"));
+
+        var attributes = ExceptionDiagnosticsExtensions.CreateAttributes(error,
+            TestContext.Current.CancellationToken).ToDictionary();
+
+        attributes["dependency_address"].ShouldBe("service.test");
+        attributes["http_request_error"].ShouldBe("NameResolutionError");
+        attributes["upstream_status_code"].ShouldBeNull();
+        string.Join(" ", attributes.Values).ShouldNotContain("private-");
+    }
+
+    [Theory]
+    [InlineData("request_aborted")]
+    [InlineData("unknown")]
+    public void CancellationSource_RequiresTheCanceledTokenToMatch(string source)
+    {
+        using var request = new CancellationTokenSource();
+        using var unrelated = new CancellationTokenSource();
+        request.Cancel();
+        unrelated.Cancel();
+        var token = source == "request_aborted" ? request.Token : unrelated.Token;
+
+        var attributes = ExceptionDiagnosticsExtensions.CreateAttributes(
+            new OperationCanceledException("private-cancellation", token), request.Token).ToDictionary();
+
+        attributes["failure_kind"].ShouldBe("canceled");
+        attributes["cancellation_source"].ShouldBe(source);
+    }
+
+    [Fact]
+    public void HttpClientTimeout_WrappedInCancellation_IsATimeout()
+    {
+        var error = new TaskCanceledException("private-cancellation", new TimeoutException("private-timeout"));
+        var attributes = ExceptionDiagnosticsExtensions.CreateAttributes(error,
+            TestContext.Current.CancellationToken).ToDictionary();
+
+        attributes["failure_kind"].ShouldBe("timeout");
+        attributes["cancellation_source"].ShouldBe("timeout");
+    }
+
+    [Fact]
+    public async Task MissingRefitResponseStatus_IsNotReportedAsZero()
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, "https://service.test/");
+        using var response = new HttpResponseMessage((HttpStatusCode)0);
+        var error = await ApiException.Create(request, request.Method, response, new RefitSettings());
+
+        error.GetHttpStatusCode().ShouldBeNull();
     }
 
     [Fact]

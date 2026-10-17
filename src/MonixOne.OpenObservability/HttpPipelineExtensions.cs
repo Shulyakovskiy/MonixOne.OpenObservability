@@ -33,6 +33,7 @@ internal sealed class CorrelationMiddleware(RequestDelegate next, ILogger<Correl
         var ownsActivity = activity is null;
         if (ownsActivity)
             activity = new Activity("http.request").SetIdFormat(ActivityIdFormat.W3C).Start();
+        using var sentryScope = SentrySdk.PushScope();
         try
         {
             var traceId = activity!.TraceId.ToString();
@@ -41,8 +42,13 @@ internal sealed class CorrelationMiddleware(RequestDelegate next, ILogger<Correl
             context.Response.Headers[LogProperties.CorrelationHeader] = traceId;
             SentrySdk.ConfigureScope(scope =>
             {
+                scope.ClearBreadcrumbs();
                 scope.SetTag(LogProperties.TraceId, traceId);
-                scope.SetTag("endpoint", (context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText ?? "{unmatched}");
+                scope.SetTag(LogProperties.SpanId, activity.SpanId.ToString());
+                var route = (context.GetEndpoint() as RouteEndpoint)?.RoutePattern.RawText ?? "{unmatched}";
+                scope.SetTag("endpoint", route);
+                scope.SetTag("http_route", route);
+                scope.SetTag("http_method", context.Request.Method);
             });
             using var scope = logger.BeginScope(new Dictionary<string, object?> { [LogProperties.TraceId] = traceId });
             await next(context);
