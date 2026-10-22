@@ -54,15 +54,17 @@ public sealed class ExceptionDiagnosticsTests
             && Equals(pair.Value, nested ? nameof(FormatException) : nameof(JsonException)));
         entry.Attributes.ShouldContain(pair => pair.Key == "json_error_line" && Equals(pair.Value, 2L));
         entry.Attributes.ShouldContain(pair => pair.Key == "json_error_byte_position" && Equals(pair.Value, 17L));
+        entry.Attributes.ShouldContain(pair => pair.Key == "failure_summary" && Equals(pair.Value,
+            "HTTP response JSON error (HTTP 200)"));
         entry.Attributes.ShouldContain(pair => pair.Key == "request_id" && Equals(pair.Value, "visible-request"));
     }
 
     [Theory]
-    [InlineData("timeout", "timeout")]
-    [InlineData("canceled", "canceled")]
-    [InlineData("http", "http_status")]
-    [InlineData("transport", "transport")]
-    public void OrdinaryLogError_ClassifiesFailureWithoutExceptionMessages(string input, string expected)
+    [InlineData("timeout", "timeout", "Timeout")]
+    [InlineData("canceled", "canceled", "Canceled: unknown")]
+    [InlineData("http", "http_status", "HTTP response error: 503")]
+    [InlineData("transport", "transport", "Transport error")]
+    public void OrdinaryLogError_ClassifiesFailureWithoutExceptionMessages(string input, string expected, string summary)
     {
         Exception exception = input switch
         {
@@ -81,6 +83,8 @@ public sealed class ExceptionDiagnosticsTests
         entry.Exception.ShouldBeNull();
         entry.Text.ShouldNotContain("private-");
         entry.Attributes.ShouldContain(pair => pair.Key == "failure_kind" && Equals(pair.Value, expected));
+        entry.Attributes.ShouldContain(pair => pair.Key == "failure_summary" && Equals(pair.Value, summary));
+        entry.Text.Split(Environment.NewLine)[0].ShouldBe($"Operation failed [{summary}]");
     }
 
     [Theory]

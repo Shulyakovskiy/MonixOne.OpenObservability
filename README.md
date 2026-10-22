@@ -44,7 +44,7 @@ ASP.NET Core и `HttpClient` используют стандартный `tracep
 
 ```xml
 <ItemGroup>
-    <PackageVersion Include="MonixOne.OpenObservability" Version="1.0.3" />
+    <PackageVersion Include="MonixOne.OpenObservability" Version="1.0.4" />
 </ItemGroup>
 ```
 
@@ -235,24 +235,30 @@ HTTP-метаданные, body-события и исключения Refit с�
 
 Маскируются пароли, токены, client secrets, API keys, OTP, authorization codes/verifiers,
 контакты, credentials/assertions/challenges, SMS text/destination и персональные поля.
-Поля `detail`, `message` и `error_description` скрываются целиком: внешние сервисы
-могут отражать в них секреты из запроса.
+Для всех этих полей действует одно правило: значение длиннее 12 символов показывает
+первые 3 и последние 2 символа, середина заменяется на `***`. Значения до 12 символов
+включительно скрываются целиком как `[REDACTED]`, в том числе короткие OTP и пароли.
+Unicode-символы и составные emoji не разрезаются. Правило применяется также к длинным
+токенам, паролям и полям `detail`, `message`, `error_description`; это намеренно
+оставляет небольшой фрагмент чувствительного значения, а не анонимизирует его.
 
 Пример очищенного тела:
 
 ```json
 {
   "request_id": "req-42",
-  "access_token": "[REDACTED]",
+  "access_token": "eyJ***Xw",
+  "otp": "[REDACTED]",
   "profile": {
-    "email": "[REDACTED]",
+    "email": "esh***ru",
     "safe": "visible"
   }
 }
 ```
 
 Формы декодируются через `QueryHelpers.ParseQuery` и логируются как очищенный JSON,
-включая повторяющиеся и percent-encoded поля.
+включая повторяющиеся и percent-encoded поля. Каждое повторяющееся значение
+маскируется отдельно. Корневые JSON-массивы используют ту же политику, что и объекты.
 Очищенные body-атрибуты и текст получают все providers: Console, OpenTelemetry
 и дополнительные провайдеры приложения.
 
@@ -339,6 +345,7 @@ logger.LogEvent(
 | `exception.type` | Полное имя типа переданного исключения |
 | `exception_stack_trace` | Типы и стеки цепочки без сообщений исключений |
 | `failure_kind` | Классификация сбоя |
+| `failure_summary` | Краткая причина для списка событий, например `Transport error: ConnectionRefused (ConnectionError)` |
 | `status_code`, `upstream_status_code` | HTTP status зависимости из Refit `ApiException` или `HttpRequestException`; `status_code` сохранён для совместимости |
 | `http_request_error` | Категория `HttpRequestError` из `HttpRequestException` или `HttpIOException`, если известна |
 | `socket_error_code` | Код `SocketException`, если найден |
@@ -387,6 +394,18 @@ HTTP-исключение и JSON-сбой в разных ветках `Aggrega
 Сырые объекты `Exception` не передаются providers: `ApiException.ToString()` может
 содержать полное HTTP-тело. Экспортируются типы, классификация и стеки без
 `Exception.Message` / `ToString()`.
+
+Краткая причина `failure_summary` также добавляется к тексту лога перед стеком:
+
+```text
+Profile exchange failed [Transport error: ConnectionRefused (ConnectionError)]
+```
+
+Она строится из типизированной диагностики. Адрес зависимости находится в
+`dependency_address` / `dependency_port`, операция — в `event_name`, корреляция —
+в `trace_id`. Сообщения исключений, URL, payload и идентификаторы запросов
+не попадают в сводку. Для HTTP-ошибки сводка показывает `HTTP response error: 503`,
+для неверного JSON ответа — `HTTP response JSON error (HTTP 200)`, для timeout — `Timeout`.
 
 ### Дополнительные расширения
 
@@ -468,6 +487,15 @@ Sentry__TracesSampleRate=0.0
 - `Exception.Data`, включая проекции в mechanism, tags и contexts;
 - HTTP URL в span data/tags, HTTP span descriptions и URL transaction names.
 
+Верхнее исключение в Sentry/Bugsink получает `failure_summary` вместо заглушки
+`[omitted: exception_message]`. Типы и стеки цепочки сохраняются; сообщения
+внутренних исключений остаются скрытыми. Это работает для обычного `LogError()`
+и прямого `SentrySdk.CaptureException()` без новых настроек.
+
+Изменение текста исключения может создать новые группы Bugsink при обновлении:
+его штатная группировка учитывает тип и значение исключения. Пакет не задаёт
+собственный fingerprint и не меняет исторические события.
+
 Пакет задаёт следующие настройки поверх секции `Sentry`:
 
 | Настройка | Значение |
@@ -492,7 +520,7 @@ HTTP-запросы получают отдельный Sentry scope, чтобы
 
 Разрешены:
 
-- `event_name`, `operation`, `error_code`, `failure_kind`, `exception.type`;
+- `event_name`, `operation`, `error_code`, `failure_kind`, `failure_summary`, `exception.type`;
 - HTTP method/route/status, снимок статуса ответа и `http_response_started`;
 - `dependency_address`, `dependency_port`, `dependency_http_method`,
   `dependency_http_route`, `dependency_client`, `upstream_status_code`;
@@ -525,6 +553,29 @@ Retry/timeout/circuit поля записывайте там, где настр�
 Пакет не создаёт retries и не предполагает их наличие.
 
 ## Расследование инцидентов
+
+Для быстрого просмотра в OpenObserve выберите Logs → поток `default`, SQL mode
+и временной интервал события. Выполните:
+
+```sql
+SELECT _timestamp, service_name, event_name, failure_summary,
+       dependency_address, dependency_port, trace_id
+FROM "default"
+WHERE severity = 'Error'
+ORDER BY _timestamp DESC
+LIMIT 100
+```
+
+Поле `failure_summary` появится в схеме потока после поступления событий новой
+версии пакета. Для всей цепочки скопируйте именно тег `trace_id` из Bugsink
+и выполните `SELECT * FROM "default" WHERE trace_id = 'СКОПИРОВАННЫЙ_ID'
+ORDER BY _timestamp ASC`, сохранив нужный временной интервал. Фильтры severity
+и service_name на этом шаге уберите, чтобы видеть завершение запроса и другие сервисы.
+
+`ConnectionRefused` означает отказ TCP-соединения в момент вызова. Конкретную
+причину отсутствия доступного listener — остановку процесса, неправильный порт,
+публикацию контейнера или сетевой REJECT — проверяйте на стороне зависимости.
+HTTP 200 входящего запроса не подтверждает успех его внутренних операций.
 
 1. Найдите бизнес-ошибку по `event_name` и определите её `trace_id`.
 2. Найдите входящий HTTP-лог и spans с тем же `trace_id`.

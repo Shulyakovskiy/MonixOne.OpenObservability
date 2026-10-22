@@ -52,7 +52,7 @@ public sealed class HttpBodyLoggingTests
             var entry = logs.Entries.Where(entry => entry.ContainsKey("ResponseBody")).ShouldHaveSingleItem();
             using var masked = System.Text.Json.JsonDocument.Parse((string)entry["ResponseBody"]!);
             masked.RootElement.GetProperty("safe").GetString().ShouldBe("visible");
-            masked.RootElement.GetProperty("password").GetString().ShouldBe("[REDACTED]");
+            masked.RootElement.GetProperty("password").GetString().ShouldBe("pri***rd");
             entry["trace_id"].ShouldBe(traceId);
             exporter.TraceIds.ShouldHaveSingleItem().ShouldBe(traceId);
         }
@@ -105,7 +105,7 @@ public sealed class HttpBodyLoggingTests
 
         var entry = logs.Entries.Where(entry => entry.ContainsKey("ResponseBody")).ShouldHaveSingleItem();
         ((string)entry["ResponseBody"]!).ShouldContain("visible");
-        ((string)entry["ResponseBody"]!).ShouldContain("[REDACTED]");
+        ((string)entry["ResponseBody"]!).ShouldContain("pri***rd");
     }
 
     [Fact]
@@ -237,7 +237,7 @@ public sealed class HttpBodyLoggingTests
         reader.ReadToEnd().ShouldContain("private-password");
 
         var entry = logs.Entries.Where(entry => entry.ContainsKey("ResponseBody")).ShouldHaveSingleItem();
-        ((string)entry["ResponseBody"]!).ShouldContain("[REDACTED]");
+        ((string)entry["ResponseBody"]!).ShouldContain("pri***rd");
         ((string)entry["ResponseBody"]!).ShouldNotContain("private-");
     }
 

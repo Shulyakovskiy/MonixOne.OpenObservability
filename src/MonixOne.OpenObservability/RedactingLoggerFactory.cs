@@ -98,7 +98,8 @@ internal sealed class RedactingLoggerFactory(ILoggerFactory inner, HttpBodySanit
                     .Select(value => $"{value.Key}: {value.Value}"))
                 : formatter(state, null);
             if (exception is not null && !hasBody)
-                message += Environment.NewLine + safeState.Last(value => value.Key == "exception_stack_trace").Value;
+                message += $" [{safeState.Last(value => value.Key == "failure_summary").Value}]"
+                    + Environment.NewLine + safeState.Last(value => value.Key == "exception_stack_trace").Value;
 
             // ApiException.ToString() can include the raw HTTP response.
             // Providers receive type, classification and stacks instead of that object.

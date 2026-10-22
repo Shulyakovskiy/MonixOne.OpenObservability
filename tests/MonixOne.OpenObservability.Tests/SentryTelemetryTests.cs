@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
@@ -137,6 +138,44 @@ public sealed class SentryTelemetryTests
         var error = entry.RootElement.GetProperty("exception").GetProperty("values")[0];
         error.GetProperty("type").GetString().ShouldBe(typeof(HttpRequestException).FullName);
         error.GetProperty("stacktrace").GetProperty("frames").GetArrayLength().ShouldBeGreaterThan(0);
+        error.GetProperty("value").GetString().ShouldBe("Transport error");
+    }
+
+    [Theory]
+    [InlineData(HttpRequestError.ConnectionError, SocketError.ConnectionRefused)]
+    [InlineData(HttpRequestError.NameResolutionError, SocketError.HostNotFound)]
+    public async Task RefitTransportFailure_ShowsTypedCauseInTheTitleWithoutRequestData(
+        HttpRequestError reason, SocketError socketError)
+    {
+        var transport = new RecordingTransport();
+        var builder = CreateBuilder(transport);
+        builder.AddOpenObservability();
+        using var host = builder.Build();
+        var logger = host.Services.GetRequiredService<ILogger<SentryTelemetryTests>>();
+        using var request = new HttpRequestMessage(HttpMethod.Post,
+            "https://private-user:private-password@service.test:7575/private-path?token=private-query");
+        request.Options.Set(new HttpRequestOptionsKey<string>(HttpRequestMessageOptions.RelativePathTemplate), "/session/{id}");
+        var error = new ApiRequestException(request, request.Method, new RefitSettings(),
+            new HttpRequestException(reason, "private-message", new SocketException((int)socketError)));
+
+        logger.LogEvent(LogLevel.Error, "profile.exchange.failed", error, "Profile exchange failed");
+        await SentrySdk.FlushAsync(TimeSpan.FromSeconds(5));
+
+        var payload = transport.Payloads.Where(value => value.Contains("profile.exchange.failed")).ShouldHaveSingleItem();
+        payload.ShouldNotContain("private-");
+        using var entry = JsonDocument.Parse(payload.Split('\n')[2]);
+        var summary = $"Transport error: {socketError} ({reason})";
+        var errors = entry.RootElement.GetProperty("exception").GetProperty("values").EnumerateArray().ToArray();
+        errors[^1].GetProperty("type").GetString().ShouldBe(typeof(ApiRequestException).FullName);
+        errors[^1].GetProperty("value").GetString().ShouldBe(summary);
+        foreach (var inner in errors[..^1])
+            inner.GetProperty("value").GetString().ShouldBe("[omitted: exception_message]");
+        var tags = entry.RootElement.GetProperty("tags");
+        tags.GetProperty("failure_summary").GetString().ShouldBe(summary);
+        tags.GetProperty("dependency_address").GetString().ShouldBe("service.test");
+        tags.GetProperty("dependency_port").GetString().ShouldBe("7575");
+        tags.TryGetProperty("upstream_status_code", out _).ShouldBeFalse();
+        entry.RootElement.GetProperty("extra").GetProperty("failure_summary").GetString().ShouldBe(summary);
     }
 
     [Fact]
@@ -173,6 +212,9 @@ public sealed class SentryTelemetryTests
         tags.GetProperty("upstream_status_code").GetString().ShouldBe("200");
         tags.GetProperty("failure_kind").GetString().ShouldBe("response_deserialization");
         tags.GetProperty("error_code").GetString().ShouldBe("invalid_response");
+        entry.RootElement.GetProperty("exception").GetProperty("values").EnumerateArray().Last()
+            .GetProperty("value").GetString().ShouldBe(
+                "HTTP response JSON error (HTTP 200)");
     }
 
     [Fact]
@@ -197,6 +239,8 @@ public sealed class SentryTelemetryTests
             using var entry = JsonDocument.Parse(payload.Split('\n')[2]);
             entry.RootElement.GetProperty("tags").GetProperty("cancellation_source").GetString().ShouldBe("request_aborted");
             entry.RootElement.GetProperty("extra").GetProperty("cancellation_source").GetString().ShouldBe("request_aborted");
+            entry.RootElement.GetProperty("exception").GetProperty("values").EnumerateArray().Last()
+                .GetProperty("value").GetString().ShouldBe("Canceled: request_aborted");
         }
         finally { accessor.HttpContext = null; }
     }
