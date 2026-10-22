@@ -6,7 +6,7 @@
         <Title>MonixOne.OpenObservability</Title>
         <Copyright>MonixOne</Copyright>
         <PackageIcon>assets/openobservability-icon.png</PackageIcon>
-        <Version>1.0.3</Version>
+        <Version>1.0.4</Version>
         <Authors>Shulyakovsky.E</Authors>
         <Description>Central OpenTelemetry logs, traces and metrics for .NET 9/10 services, with Sentry integration, HTTP body masking and automatic exception diagnostics.</Description>
         <PackageTags>opentelemetry;observability;logging;tracing;metrics;sentry;http;httpclient;redaction;aspnetcore</PackageTags>
@@ -16,7 +16,7 @@
         <RepositoryUrl>https://github.com/Shulyakovskiy/MonixOne.OpenObservability</RepositoryUrl>
         <RepositoryType>git</RepositoryType>
         <PublishRepositoryUrl>true</PublishRepositoryUrl>
-        <PackageReleaseNotes>Improve JSON failure classification and HTTP status semantics. Add safe dependency, network error and cancellation context, plus sanitized Sentry breadcrumbs with request isolation and preserved timestamps.</PackageReleaseNotes>
+        <PackageReleaseNotes>Expose safe failure summaries in logs and Sentry exception titles. HTTP body masking now retains the first 3 and last 2 characters of sensitive values longer than 12 characters; shorter values remain fully redacted. Apply the same policy to JSON arrays and repeated form values.</PackageReleaseNotes>
         <GeneratePackageOnBuild>true</GeneratePackageOnBuild>
         <IncludeSymbols>true</IncludeSymbols>
         <SymbolPackageFormat>snupkg</SymbolPackageFormat>

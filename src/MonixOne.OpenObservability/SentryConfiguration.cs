@@ -113,6 +113,10 @@ internal static class SentryConfiguration
             foreach (var attribute in ExceptionDiagnosticsExtensions.CreateAttributes(exception))
                 entry.SetExtra(attribute.Key,
                     logAttributes?.LastOrDefault(field => field.Key == attribute.Key).Value ?? attribute.Value);
+            // Sentry's exception interface stores the outermost exception last.
+            // Keep inner messages omitted rather than attributing one branch's diagnostics to another.
+            if (entry.SentryExceptions?.LastOrDefault() is { } outermost)
+                outermost.Value = (string)entry.Extra["failure_summary"]!;
         }
         SanitizeRequest(entry);
         return entry;
@@ -177,7 +181,7 @@ internal static class SentryConfiguration
     }
 
     private static bool IsBreadcrumbField(string key) => key is
-        "event_name" or "operation" or "error_code" or "failure_kind" or "http_request_error" or "socket_error_code"
+        "event_name" or "operation" or "error_code" or "failure_kind" or "failure_summary" or "http_request_error" or "socket_error_code"
         or "exception.type" or "json_error_line" or "json_error_byte_position"
         or "http_method" or "http_route" or "http_status_code" or "http_response_status_code_at_log" or "http_response_started"
         or "dependency_address" or "dependency_port" or "dependency_http_method" or "dependency_http_route" or "dependency_client"

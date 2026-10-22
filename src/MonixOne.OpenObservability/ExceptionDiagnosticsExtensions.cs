@@ -84,6 +84,25 @@ public static class ExceptionDiagnosticsExtensions
             HttpIOException http => http.HttpRequestError,
             _ => null
         }).FirstOrDefault(error => error is not null and not HttpRequestError.Unknown);
+        var socketError = chain.OfType<SocketException>().FirstOrDefault()?.SocketErrorCode;
+        var cancellationSource = kind == "timeout" ? "timeout"
+            : requestAborted.IsCancellationRequested && cancellation?.CancellationToken == requestAborted ? "request_aborted"
+            : "unknown";
+        // Titles contain typed causes only; messages, URLs and request identifiers stay out.
+        var summary = kind switch
+        {
+            "transport" when socketError is not null && requestError is not null =>
+                $"Transport error: {socketError} ({requestError})",
+            "transport" when socketError is not null || requestError is not null =>
+                $"Transport error: {socketError?.ToString() ?? requestError?.ToString()}",
+            "transport" => "Transport error",
+            "http_status" => $"HTTP response error: {status}",
+            "response_deserialization" => "HTTP response JSON error" + (status is not null ? $" (HTTP {status})" : ""),
+            "json" => "JSON error",
+            "timeout" => "Timeout",
+            "canceled" => $"Canceled: {cancellationSource}",
+            _ => "Application error"
+        };
 
         List<KeyValuePair<string, object?>> attributes =
         [
@@ -92,19 +111,18 @@ public static class ExceptionDiagnosticsExtensions
             new("exception_root_type", exception.GetBaseException().GetType().Name),
             new("exception.type", exception.GetType().FullName),
             new("failure_kind", kind),
+            new("failure_summary", summary),
             new("status_code", status),
             new("upstream_status_code", status),
             new("http_request_error", requestError?.ToString()),
-            new("socket_error_code", chain.OfType<SocketException>().FirstOrDefault()?.SocketErrorCode.ToString()),
+            new("socket_error_code", socketError?.ToString()),
             new("json_error_line", jsonError?.LineNumber),
             new("json_error_byte_position", jsonError?.BytePositionInLine),
             new("exception_stack_trace", string.Join(Environment.NewLine,
                 chain.Select(error => $"{error.GetType().FullName}{Environment.NewLine}{error.StackTrace}")))
         ];
         if (kind is "timeout" or "canceled")
-            attributes.Add(new("cancellation_source", kind == "timeout" ? "timeout"
-                : requestAborted.IsCancellationRequested && cancellation!.CancellationToken == requestAborted ? "request_aborted"
-                : "unknown"));
+            attributes.Add(new("cancellation_source", cancellationSource));
         if ((jsonResponse ?? chain.OfType<ApiExceptionBase>().FirstOrDefault()) is { } apiError)
             attributes.AddRange(ServiceHttpClientLogEnricher.CreateRequestAttributes(apiError.RequestMessage));
         return attributes;

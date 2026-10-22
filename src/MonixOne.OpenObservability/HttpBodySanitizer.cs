@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using JsonMasking;
@@ -24,6 +25,9 @@ internal sealed class HttpBodySanitizer
         "*cardnumber*", "*card_number*", "*cvv*", "*ssn*", "*iban*"
     ];
 
+    private static readonly Dictionary<string, Func<string, string>> _partialMasks =
+        _sensitiveFields.ToDictionary(field => field, _ => (Func<string, string>)MaskValue, StringComparer.OrdinalIgnoreCase);
+
     internal string Sanitize(string body, string? contentType)
     {
         if (string.IsNullOrWhiteSpace(body))
@@ -34,26 +38,41 @@ internal sealed class HttpBodySanitizer
         try
         {
             var mediaType = contentType?.Split(';', 2)[0].Trim();
-            string json;
+            string masked;
             if (string.Equals(mediaType, "application/x-www-form-urlencoded", StringComparison.OrdinalIgnoreCase))
             {
                 // Decode field names and repeated values with the platform parser.
-                // JsonMasking applies the same rules to the resulting JSON object.
+                // Apply the library's field rules to each value, preserving repeated fields.
                 var form = QueryHelpers.ParseQuery(body);
-                json = JsonSerializer.Serialize(form.ToDictionary(field => field.Key,
-                    field => field.Value.ToArray()));
+                masked = JsonSerializer.Serialize(form.ToDictionary(field => field.Key,
+                    field => field.Value.Select(value =>
+                    {
+                        var json = JsonSerializer.Serialize(new Dictionary<string, string?> { [field.Key] = value });
+                        using var document = JsonDocument.Parse(json.MaskFields(_sensitiveFields, "[REDACTED]", _partialMasks));
+                        return document.RootElement.GetProperty(field.Key).GetString();
+                    }).ToArray()));
             }
             else if (string.Equals(mediaType, "application/json", StringComparison.OrdinalIgnoreCase)
                      || mediaType?.EndsWith("+json", StringComparison.OrdinalIgnoreCase) == true)
-                json = body;
+            {
+                using var document = JsonDocument.Parse(body, new JsonDocumentOptions { MaxDepth = 32 });
+                if (document.RootElement.ValueKind is not (JsonValueKind.Object or JsonValueKind.Array))
+                    return "[omitted: unsupported_json_root]";
+
+                // JsonMasking 2.0.0 skips partial callbacks for a root array.
+                // A neutral object wrapper uses its existing recursive implementation instead.
+                var rootArray = document.RootElement.ValueKind == JsonValueKind.Array;
+                masked = (rootArray ? "{\"items\":" + body + "}" : body)
+                    .MaskFields(_sensitiveFields, "[REDACTED]", _partialMasks);
+                if (rootArray)
+                {
+                    using var wrapper = JsonDocument.Parse(masked);
+                    masked = wrapper.RootElement.GetProperty("items").GetRawText();
+                }
+            }
             else
                 return "[omitted: unsupported_content_type]";
 
-            using var document = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 32 });
-            if (document.RootElement.ValueKind is not (JsonValueKind.Object or JsonValueKind.Array))
-                return "[omitted: unsupported_json_root]";
-
-            var masked = json.MaskFields(_sensitiveFields, "[REDACTED]");
             return Encoding.UTF8.GetByteCount(masked) > HttpLoggingConfiguration.BodyLimitBytes
                 ? "[omitted: masked_body_limit]"
                 : masked;
@@ -72,5 +91,13 @@ internal sealed class HttpBodySanitizer
         {
             return "[omitted: invalid_json]";
         }
+    }
+
+    private static string MaskValue(string value)
+    {
+        var characters = StringInfo.ParseCombiningCharacters(value);
+        return characters.Length > 12
+            ? value[..characters[3]] + "***" + value[characters[^2]..]
+            : "[REDACTED]";
     }
 }
